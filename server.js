@@ -35,6 +35,10 @@ const conversationHistory = new Map();  // groupId → [{ role, name, content, t
 const displayNameCache = new Map();     // userId → displayName
 let botProfile = { userId: null, displayName: null };
 
+// ----- 學習需求 & 講師申請 -----
+const pendingLearningNeeds = [];                // [{ userId, displayName, need, timestamp }]
+const pendingInstructorApps = new Map();         // userId → { displayName, email, academyName, sourceId, timestamp, status }
+
 // ============================================================
 //  LINE API 工具函數
 // ============================================================
@@ -135,6 +139,126 @@ function addToHistory(sourceId, entry) {
 
 function getHistory(sourceId) {
   return conversationHistory.get(sourceId) || [];
+}
+
+// ============================================================
+//  動作標記解析 — 解析 AI 回覆中的 <<ACTION:...>> 標記
+// ============================================================
+
+function parseActionTags(text) {
+  const actions = [];
+  const cleanText = text.replace(/<<ACTION:(.*?)>>/g, (_match, content) => {
+    actions.push(content.trim());
+    return '';
+  });
+  return { cleanText: cleanText.trim(), actions };
+}
+
+async function processActions(actions, userId, displayName, sourceId) {
+  for (const action of actions) {
+    if (action.startsWith('LEARNING_NEED:')) {
+      const need = action.slice('LEARNING_NEED:'.length).trim();
+      pendingLearningNeeds.push({
+        userId,
+        displayName,
+        need,
+        timestamp: new Date().toISOString(),
+      });
+      console.log(`[學習需求] ${displayName}: ${need}`);
+
+    } else if (action.startsWith('INSTRUCTOR_APP:')) {
+      const payload = action.slice('INSTRUCTOR_APP:'.length).trim();
+      const separatorIndex = payload.indexOf('|');
+      if (separatorIndex === -1) {
+        console.warn(`[講師申請] 格式錯誤: ${payload}`);
+        continue;
+      }
+      const email = payload.slice(0, separatorIndex).trim();
+      const academyName = payload.slice(separatorIndex + 1).trim();
+
+      pendingInstructorApps.set(userId, {
+        userId,
+        displayName,
+        email,
+        academyName,
+        sourceId,
+        timestamp: new Date().toISOString(),
+        status: 'pending',
+      });
+
+      console.log(`[講師申請] ${displayName} (${email}, ${academyName})`);
+      await notifyAdminInstructorApp(userId, displayName, email, academyName);
+    }
+  }
+}
+
+async function notifyAdminInstructorApp(userId, displayName, email, academyName) {
+  const admins = config.members.filter(m => m.role === 'admin');
+  const message = [
+    `【講師申請通知】`,
+    `LINE 顯示名稱：${displayName}`,
+    `LINE userId：${userId}`,
+    `學院註冊名稱：${academyName}`,
+    `Email：${email}`,
+    ``,
+    `請審核後使用以下指令提供講師碼：`,
+    `/講師碼 ${userId} 您的講師邀請碼`,
+  ].join('\n');
+
+  for (const admin of admins) {
+    await linePush(admin.userId, message);
+  }
+}
+
+// ============================================================
+//  每日學習需求彙整（台灣時間每晚 20:00）
+// ============================================================
+
+function scheduleDailyLearningReport() {
+  let lastSentDate = null;
+
+  setInterval(() => {
+    const now = new Date();
+    // 台灣時間 = UTC + 8
+    const taiwanHour = (now.getUTCHours() + 8) % 24;
+    const todayStr = now.toISOString().slice(0, 10);
+
+    if (taiwanHour === 20 && now.getUTCMinutes() === 0 && lastSentDate !== todayStr) {
+      lastSentDate = todayStr;
+      sendDailyLearningReport();
+    }
+  }, 60 * 1000); // 每分鐘檢查一次
+
+  console.log('[排程] 學習需求日報排程已啟動（每日台灣時間 20:00）');
+}
+
+async function sendDailyLearningReport() {
+  if (pendingLearningNeeds.length === 0) {
+    console.log('[日報] 今日無學習需求，跳過發送');
+    return;
+  }
+
+  const needsList = pendingLearningNeeds.map((item, i) =>
+    `${i + 1}. ${item.displayName}：${item.need}（${new Date(item.timestamp).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}）`
+  ).join('\n');
+
+  const message = [
+    `【每日學習需求彙整】`,
+    `日期：${new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' })}`,
+    `共 ${pendingLearningNeeds.length} 筆需求：`,
+    ``,
+    needsList,
+  ].join('\n');
+
+  const admins = config.members.filter(m => m.role === 'admin');
+  for (const admin of admins) {
+    await linePush(admin.userId, message);
+  }
+
+  console.log(`[日報] 已發送 ${pendingLearningNeeds.length} 筆學習需求給管理員`);
+
+  // 清空已發送的需求
+  pendingLearningNeeds.length = 0;
 }
 
 // ============================================================
@@ -331,14 +455,24 @@ async function handleEvent(event) {
   const aiReply = await callOpenRouter(messages);
 
   if (aiReply) {
-    await lineReply(replyToken, aiReply);
+    // 解析動作標記並移除（使用者不會看到）
+    const { cleanText, actions } = parseActionTags(aiReply);
 
-    // 存入歷史
+    // 執行動作（學習需求記錄、講師申請轉發等）
+    if (actions.length > 0) {
+      processActions(actions, userId, displayName, sourceId).catch(err =>
+        console.error('動作執行錯誤:', err)
+      );
+    }
+
+    await lineReply(replyToken, cleanText);
+
+    // 存入歷史（存乾淨版本）
     addToHistory(sourceId, {
       role: 'assistant',
       name: config.botName,
       userId: botProfile.userId,
-      content: aiReply,
+      content: cleanText,
       timestamp: new Date().toISOString(),
     });
   } else {
@@ -389,6 +523,78 @@ async function handleAdminCommand(text, replyToken, sourceId) {
       return true;
     }
 
+    case '/講師碼': {
+      // 格式：/講師碼 <userId> <邀請碼>
+      if (cmd.length < 3) {
+        await lineReply(replyToken, '格式：/講師碼 <userId> <講師邀請碼>');
+        return true;
+      }
+      const targetUserId = cmd[1];
+      const instructorCode = cmd.slice(2).join(' ');
+      const app = pendingInstructorApps.get(targetUserId);
+
+      if (!app) {
+        await lineReply(replyToken, `找不到 userId 為 ${targetUserId} 的講師申請記錄。`);
+        return true;
+      }
+
+      await linePush(targetUserId,
+        `嗨 ${app.displayName}！好消息 🎉\n\n` +
+        `您的講師申請已經通過審核！\n` +
+        `以下是您的講師邀請碼：\n\n` +
+        `${instructorCode}\n\n` +
+        `請使用此邀請碼在凝聚力學院官網完成講師身份設定。\n` +
+        `如有任何問題，隨時可以找我喔！😊`
+      );
+
+      app.status = 'approved';
+      await lineReply(replyToken, `已將講師邀請碼傳送給 ${app.displayName}（${targetUserId}）。`);
+      return true;
+    }
+
+    case '/查看申請': {
+      if (pendingInstructorApps.size === 0) {
+        await lineReply(replyToken, '目前沒有待處理的講師申請。');
+        return true;
+      }
+      const appList = Array.from(pendingInstructorApps.values())
+        .map((app, i) => [
+          `${i + 1}. ${app.displayName}`,
+          `   學院名稱：${app.academyName}`,
+          `   Email：${app.email}`,
+          `   userId：${app.userId}`,
+          `   狀態：${app.status === 'approved' ? '已通過' : '待審核'}`,
+        ].join('\n'))
+        .join('\n\n');
+      await lineReply(replyToken, `【講師申請列表】\n\n${appList}`);
+      return true;
+    }
+
+    case '/查看需求': {
+      if (pendingLearningNeeds.length === 0) {
+        await lineReply(replyToken, '目前沒有待彙整的學習需求。');
+        return true;
+      }
+      const needsList = pendingLearningNeeds
+        .map((item, i) => `${i + 1}. ${item.displayName}：${item.need}`)
+        .join('\n');
+      await lineReply(replyToken,
+        `【待彙整學習需求】（共 ${pendingLearningNeeds.length} 筆）\n\n${needsList}\n\n` +
+        `系統將於每晚 20:00 自動彙整發送。\n如需立即發送，請使用 /發送需求`
+      );
+      return true;
+    }
+
+    case '/發送需求': {
+      if (pendingLearningNeeds.length === 0) {
+        await lineReply(replyToken, '目前沒有待彙整的學習需求。');
+        return true;
+      }
+      await sendDailyLearningReport();
+      await lineReply(replyToken, '已手動發送學習需求彙整報告。');
+      return true;
+    }
+
     case '/help':
     case '/說明': {
       const help = [
@@ -396,6 +602,10 @@ async function handleAdminCommand(text, replyToken, sourceId) {
         `/摘要 — 產生目前對話的重點摘要`,
         `/清除歷史 — 清除此群組的對話紀錄`,
         `/狀態 — 查看系統狀態`,
+        `/查看申請 — 查看待處理的講師申請`,
+        `/查看需求 — 查看待彙整的學習需求`,
+        `/發送需求 — 立即發送學習需求彙整`,
+        `/講師碼 <userId> <碼> — 發送講師邀請碼`,
         `/說明 — 顯示此說明`,
         ``,
         `【一般使用】`,
@@ -476,6 +686,9 @@ async function start() {
 
   // 取得 Bot 自身資訊
   await fetchBotProfile();
+
+  // 啟動每日學習需求彙整排程
+  scheduleDailyLearningReport();
 
   app.listen(PORT, () => {
     console.log(`伺服器啟動: http://localhost:${PORT}`);
