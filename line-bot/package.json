@@ -1,0 +1,17 @@
+{
+  "name": "line-ai-assistant",
+  "version": "1.0.0",
+  "description": "LINE AI 客服助理 - OpenRouter API 驅動",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
